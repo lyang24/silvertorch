@@ -860,8 +860,59 @@ class TestFusedKmeanAnn(unittest.TestCase):
         torch.testing.assert_close(scores, expected_scores, atol=0, rtol=0)
         torch.testing.assert_close(indices, expected_indices, atol=0, rtol=0)
 
+        def graph_call():
+            return torch.ops.st.fused_kmean_ann_cuda_graph(
+                cluster_offsets,
+                cluster_ids,
+                cluster_lengths,
+                embeddings,
+                queries,
+                capacity,
+                **kwargs,
+            )
+
+        graph, (graph_scores, graph_indices, graph_overflow) = (
+            self._capture_scan(graph_call)
+        )
+        for _ in range(3):
+            if dtype == torch.int8:
+                queries.copy_(torch.randint_like(queries, low, high))
+            else:
+                queries.normal_()
+            expected_scores, expected_indices = torch.ops.st.fused_kmean_ann(
+                cluster_offsets,
+                cluster_ids,
+                cluster_lengths,
+                embeddings,
+                queries,
+                capacity,
+                **kwargs,
+            )
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertEqual(graph_overflow.item(), 0)
+            torch.testing.assert_close(
+                graph_scores, expected_scores, atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                graph_indices, expected_indices, atol=0, rtol=0
+            )
+
+    def _capture_scan(self, call):
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                call()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = call()
+        return graph, output
+
     def test_cuda_graph_scan_matches_eager(self) -> None:
-        if not HAS_CUDA:
+        if not HAS_CUDA or torch.version.hip:
             self.skipTest("CUDA not available")
 
         cases = (
@@ -890,7 +941,7 @@ class TestFusedKmeanAnn(unittest.TestCase):
                 )
 
     def test_cuda_graph_scan_empty_selection(self) -> None:
-        if not HAS_CUDA:
+        if not HAS_CUDA or torch.version.hip:
             self.skipTest("CUDA not available")
 
         offsets = torch.tensor([0, 1], dtype=torch.long, device="cuda")
@@ -912,8 +963,21 @@ class TestFusedKmeanAnn(unittest.TestCase):
         self.assertTrue(torch.all(indices == -99))
         self.assertEqual(scores.shape, (2, 32))
 
+        def call():
+            return torch.ops.st.fused_kmean_ann_cuda_graph(
+                offsets, cluster_ids, lengths, embeddings, queries, 17,
+                invalid_index_value=-99,
+            )
+
+        graph, (graph_scores, graph_indices, graph_overflow) = self._capture_scan(call)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(graph_overflow.item(), 0)
+        torch.testing.assert_close(graph_scores, scores, atol=0, rtol=0)
+        torch.testing.assert_close(graph_indices, indices, atol=0, rtol=0)
+
     def test_cuda_graph_scan_replays_different_rows(self) -> None:
-        if not HAS_CUDA:
+        if not HAS_CUDA or torch.version.hip:
             self.skipTest("CUDA not available")
 
         lengths_1d = torch.tensor(
@@ -986,7 +1050,7 @@ class TestFusedKmeanAnn(unittest.TestCase):
             )
 
     def test_cuda_graph_scan_capacity_boundary_and_overflow(self) -> None:
-        if not HAS_CUDA:
+        if not HAS_CUDA or torch.version.hip:
             self.skipTest("CUDA not available")
 
         offsets = torch.tensor([0, 32, 64], dtype=torch.long, device="cuda")
@@ -1022,7 +1086,7 @@ class TestFusedKmeanAnn(unittest.TestCase):
         self.assertEqual(recovered_overflow.item(), 0)
 
     def test_cuda_graph_scan_overflow_flag_resets_on_replay(self) -> None:
-        if not HAS_CUDA:
+        if not HAS_CUDA or torch.version.hip:
             self.skipTest("CUDA not available")
 
         offsets = torch.tensor([0, 32, 96], dtype=torch.long, device="cuda")
@@ -1065,6 +1129,100 @@ class TestFusedKmeanAnn(unittest.TestCase):
         graph.replay()
         torch.cuda.synchronize()
         self.assertEqual(overflow.item(), 1)
+
+    def test_cuda_graph_scan_tail_overflow(self) -> None:
+        if not HAS_CUDA or torch.version.hip:
+            self.skipTest("NVIDIA CUDA not available")
+
+        cases = (
+            ([33, 45], [[0, 1]]),
+            # The same warp sees an invalid slot from row 0 and valid slots
+            # from row 1; every eight-lane group must still shuffle.
+            ([31, 2, 1, 0], [[0, 1], [2, 3]]),
+        )
+        for sizes, selected in cases:
+            with self.subTest(sizes=sizes):
+                sizes = torch.tensor(sizes, dtype=torch.long, device="cuda")
+                offsets = torch.cat([sizes.new_zeros(1), sizes.cumsum(0)])
+                ids = torch.tensor(selected, dtype=torch.long, device="cuda")
+                lengths = sizes[ids]
+                embeddings = torch.randint(
+                    -128, 128, (int(offsets[-1]), 128),
+                    dtype=torch.int8, device="cuda",
+                )
+                queries = torch.randint(
+                    -128, 128, (ids.size(0), 128),
+                    dtype=torch.int8, device="cuda",
+                )
+
+                def call():
+                    return torch.ops.st.fused_kmean_ann_cuda_graph(
+                        offsets, ids, lengths, embeddings, queries, 32
+                    )
+
+                graph, (scores, indices, overflow) = self._capture_scan(call)
+                for _ in range(3):
+                    queries.copy_(torch.randint_like(queries, -128, 128))
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertEqual(overflow.item(), 1)
+                    torch.testing.assert_close(
+                        indices[0],
+                        torch.arange(32, dtype=torch.int32, device="cuda"),
+                        atol=0,
+                        rtol=0,
+                    )
+                    for row in range(ids.size(0)):
+                        valid = indices[row] != -1
+                        docs = indices[row, valid].long()
+                        self.assertTrue(torch.all(docs >= 0))
+                        self.assertTrue(torch.all(docs < embeddings.size(0)))
+                        expected = (
+                            embeddings[docs].int() * queries[row].int()
+                        ).sum(dim=1, dtype=torch.int32)
+                        torch.testing.assert_close(
+                            scores[row, valid], expected, atol=0, rtol=0
+                        )
+                    if ids.size(0) == 2:
+                        self.assertEqual(indices[1, 0].item(), 33)
+
+    def test_cuda_graph_scan_filter_row_mapping(self) -> None:
+        if not HAS_CUDA or torch.version.hip:
+            self.skipTest("NVIDIA CUDA not available")
+
+        offsets = torch.tensor([0, 33, 78], device="cuda")
+        ids = torch.tensor([[0], [1]], device="cuda")
+        lengths = torch.tensor([[33], [45]], device="cuda")
+        embeddings = torch.randint(
+            -128, 128, (78, 128), dtype=torch.int8, device="cuda"
+        )
+        queries = torch.randint(
+            -128, 128, (2, 128), dtype=torch.int8, device="cuda"
+        )
+        masks = torch.tensor(
+            [[-1, -1], [0, 0], [-6148914691236517206] * 2],
+            dtype=torch.long, device="cuda",
+        )
+        mapping = torch.tensor([2, 0], device="cuda")
+
+        def call():
+            return torch.ops.st.fused_kmean_ann_cuda_graph(
+                offsets, ids, lengths, embeddings, queries, 64,
+                filtering_bit_mask=masks, filtering_bit_index=mapping,
+            )
+
+        graph, (scores, indices, overflow) = self._capture_scan(call)
+        for rows in ([2, 0], [1, 2], [0, 1]):
+            mapping.copy_(mapping.new_tensor(rows))
+            expected_scores, expected_indices = torch.ops.st.fused_kmean_ann(
+                offsets, ids, lengths, embeddings, queries, 64,
+                filtering_bit_mask=masks[mapping].contiguous(),
+            )
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertEqual(overflow.item(), 0)
+            torch.testing.assert_close(scores, expected_scores, atol=0, rtol=0)
+            torch.testing.assert_close(indices, expected_indices, atol=0, rtol=0)
 
     # ---- dtype output tests ----
 

@@ -1437,7 +1437,7 @@ __inline__ __device__ int32_t cuda_graph_work_count(
     const int32_t* count,
     int32_t capacity,
     int32_t* overflow) {
-  const int32_t actual = __ldg(count);
+  const int32_t actual = count == nullptr ? 0 : __ldg(count);
   if (actual > capacity && threadIdx.x == 0) {
     atomicExch(overflow, 1);
   }
@@ -1449,8 +1449,7 @@ template <
     typename RETURN_T,
     int DIM,
     bool FILTER,
-    typename DIVISOR_INPUT,
-    bool QUERY_ON_SHARED_MEM = false>
+    typename DIVISOR_INPUT>
 __global__ void process_cluster_cuda_graph(
     const EMBEDDING_T* embeddings,
     const EMBEDDING_T* queries,
@@ -1463,8 +1462,6 @@ __global__ void process_cluster_cuda_graph(
     int32_t* overflow,
     DIVISOR_INPUT divisor_for_int8,
     TORCH_DSA_KERNEL_ARGS) {
-  constexpr int kWarpsInBlock = kBlockSize / kWarpThreadCount;
-  __shared__ EMBEDDING_T shared_queries[kWarpsInBlock][DIM];
   const int32_t work_count =
       cuda_graph_work_count(total_needed_warps, warp_capacity, overflow);
 
@@ -1492,38 +1489,15 @@ __global__ void process_cluster_cuda_graph(
     decltype(resolve_divisor(divisor_for_int8, doc_index)) divisor_value =
         resolve_divisor(divisor_for_int8, doc_index);
 
-    if constexpr (QUERY_ON_SHARED_MEM) {
-      const EMBEDDING_T* query =
-          queries + payload.cluster_ids_row * DIM;
-#pragma unroll
-      for (uint32_t d = threadIdx.x; d < DIM; d += kWarpThreadCount) {
-        shared_queries[threadIdx.y][d] = *(query + d);
-      }
-      __syncwarp();
-      store_with_direct_query<
-          EMBEDDING_T,
-          RETURN_T,
-          DIM,
-          FILTER,
-          decltype(divisor_value)>(
-          embeddings,
-          shared_queries[threadIdx.y],
-          doc_index,
-          divisor_value,
-          results + write_index,
-          indices + write_index,
-          get_filtering_mask<FILTER>(payload.filtering_mask, threadIdx.x));
-    } else {
-      store<EMBEDDING_T, RETURN_T, DIM, FILTER, decltype(divisor_value)>(
-          embeddings,
-          queries,
-          doc_index,
-          payload.cluster_ids_row,
-          divisor_value,
-          results + write_index,
-          indices + write_index,
-          get_filtering_mask<FILTER>(payload.filtering_mask, threadIdx.x));
-    }
+    store<EMBEDDING_T, RETURN_T, DIM, FILTER, decltype(divisor_value)>(
+        embeddings,
+        queries,
+        doc_index,
+        payload.cluster_ids_row,
+        divisor_value,
+        results + write_index,
+        indices + write_index,
+        get_filtering_mask<FILTER>(payload.filtering_mask, threadIdx.x));
   }
 }
 
@@ -1685,12 +1659,11 @@ __global__ void process_cluster_remaining_cooperative_int8_cuda_graph(
         payload.cluster_ids_row * max_tensor_size_per_row;
     const bool valid = payload.write_index >= row_begin &&
         payload.write_index < row_begin + max_tensor_size_per_row;
-    if (!valid) {
-      if (lane == 0) {
-        atomicExch(overflow, 1);
-      }
-      continue;
+    if (!valid && writes_document && active) {
+      atomicExch(overflow, 1);
     }
+    // A bad output slot does not invalidate the document/query pointers.
+    // Every lane must still reach get_score's full-mask warp shuffles.
     const int8_t* query = queries +
         static_cast<int64_t>(payload.cluster_ids_row) * DIM;
     const RETURN_T score = get_score<
@@ -1703,7 +1676,7 @@ __global__ void process_cluster_remaining_cooperative_int8_cuda_graph(
         embeddings + static_cast<int64_t>(payload.doc_index) * DIM,
         query,
         divisor_for_int8);
-    if (writes_document && active) {
+    if (writes_document && active && valid) {
       results[payload.write_index] = score;
       indices[payload.write_index] = payload.doc_index;
     }
@@ -2426,8 +2399,7 @@ std::tuple<Tensor, Tensor, Tensor> fused_kmean_ann_run_cuda_graph_payloads(
               RETURN_TYPE,                                                   \
               DIM,                                                           \
               FILTER,                                                        \
-              c10::Half*,                                                    \
-              false>),                                                       \
+              c10::Half*>),                                                  \
           warp_grid_size,                                                    \
           dim3(kWarpThreadCount, kWarpsInBlock),                             \
           0,                                                                 \
@@ -2471,8 +2443,7 @@ std::tuple<Tensor, Tensor, Tensor> fused_kmean_ann_run_cuda_graph_payloads(
               RETURN_TYPE,                                                   \
               DIM,                                                           \
               FILTER,                                                        \
-              int32_t,                                                       \
-              false>),                                                       \
+              int32_t>),                                                     \
           warp_grid_size,                                                    \
           dim3(kWarpThreadCount, kWarpsInBlock),                             \
           0,                                                                 \
@@ -3039,7 +3010,7 @@ std::tuple<Tensor, Tensor, Tensor> fused_kmean_ann_cuda_graph(
       TORCH_CHECK(filtering_bit_index->size(0) == cluster_ids.size(0));
       TORCH_CHECK(filtering_bit_index->is_cuda());
       TORCH_CHECK(filtering_bit_index->dim() == 1);
-      TORCH_CHECK(filtering_bit_index->size(0) >= filtering_bit_mask->size(0));
+      TORCH_CHECK(filtering_bit_index->is_contiguous());
       filtering_bitmask_index_ptr = reinterpret_cast<const uint64_t*>(
           filtering_bit_index->data_ptr<int64_t>());
     } else {
