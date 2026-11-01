@@ -294,7 +294,9 @@ cluster_ids = routing(torch.randn(16, 256, device="cuda"))
 
 The precision choice is fixed when the module is constructed, so both modes
 can be captured in a CUDA graph. FP16 can change the selected clusters around
-score ties; measure retrieval recall on your own index before enabling it.
+score ties. PyTorch may also use reduced-precision FP16 accumulation when
+`torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction` is enabled.
+Measure retrieval recall on your own index before enabling FP16 routing.
 
 ---
 

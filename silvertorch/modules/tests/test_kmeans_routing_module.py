@@ -31,7 +31,7 @@ class TestKMeansRoutingModule(unittest.TestCase):
         self, queries: torch.Tensor, centroids: torch.Tensor, nprobe: int
     ) -> torch.Tensor:
         scores = torch.mm(F.normalize(queries, dim=1), centroids.t())
-        return torch.topk(scores, nprobe, dim=1, sorted=False).indices
+        return torch.topk(scores, nprobe, dim=1, sorted=True).indices
 
     def test_fp32_is_default_and_matches_existing_composition(self) -> None:
         module = KMeansRoutingModule(self.centroids, nprobe=8)
@@ -55,12 +55,18 @@ class TestKMeansRoutingModule(unittest.TestCase):
             ),
             8,
             dim=1,
-            sorted=False,
+            sorted=True,
         ).indices
+
+        manual_scores = torch.mm(
+            F.normalize(self.queries, dim=1).half(), self.centroids.half().t()
+        )
+        actual_scores = torch.gather(manual_scores, 1, actual)
 
         self.assertEqual(module.centroids.dtype, torch.float16)
         self.assertEqual(actual.dtype, torch.int64)
         self.assertTrue(torch.equal(actual, expected))
+        self.assertTrue(torch.all(actual_scores[:, :-1] >= actual_scores[:, 1:]))
 
     def test_fp16_owns_only_one_half_precision_centroid_buffer(self) -> None:
         module = KMeansRoutingModule(

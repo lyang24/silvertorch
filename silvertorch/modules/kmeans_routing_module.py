@@ -31,6 +31,11 @@ class KMeansRoutingModule(nn.Module):
     Keeping the precision choice static makes both paths CUDA-graph capturable
     and avoids any copy or cast in the default FP32 path.
 
+    PyTorch may use reduced-precision accumulation for FP16 matrix
+    multiplication when
+    ``torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction`` is
+    enabled. This can introduce additional routing-score error around ties.
+
     Args:
         centroids: Contiguous FP32 tensor shaped ``(num_clusters, dimension)``.
         nprobe: Number of clusters to select for each query.
@@ -86,6 +91,4 @@ class KMeansRoutingModule(nn.Module):
         if self.use_fp16_routing:
             normalized_queries = normalized_queries.half()
         routing_scores = torch.mm(normalized_queries, self.centroids.t())
-        return torch.topk(
-            routing_scores, self.nprobe, dim=1, sorted=False
-        ).indices
+        return torch.topk(routing_scores, self.nprobe, dim=1, sorted=True).indices
