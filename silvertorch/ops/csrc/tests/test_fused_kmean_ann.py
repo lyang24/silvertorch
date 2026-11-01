@@ -665,6 +665,40 @@ class TestFusedKmeanAnn(unittest.TestCase):
                 with self.subTest(dim=dim, divisor=divisor_for_int8):
                     self._run_mixed_cluster_int8(dim, divisor_for_int8)
 
+    def test_int8_clusters_all_warp_aligned(self) -> None:
+        cluster_lengths_1d = torch.tensor([32, 64, 96], dtype=torch.long)
+        cluster_offsets = torch.cat(
+            [torch.zeros(1, dtype=torch.long), cluster_lengths_1d.cumsum(0)]
+        )
+        cluster_ids = torch.tensor([[0, 1, 2], [2, 1, 0]], dtype=torch.long)
+        cluster_lengths = cluster_lengths_1d[cluster_ids]
+        embeddings = torch.randint(
+            -128, 128, (int(cluster_offsets[-1]), 256), dtype=torch.int8
+        )
+        queries = torch.randint(-128, 128, (2, 256), dtype=torch.int8)
+        expected_scores, expected_indices = _compute_expected_scores(
+            cluster_offsets,
+            cluster_ids,
+            cluster_lengths,
+            embeddings,
+            queries,
+            divisor_for_int8=-1,
+        )
+
+        self._run_cpu_and_gpu(
+            cluster_offsets,
+            cluster_ids,
+            cluster_lengths,
+            embeddings,
+            queries,
+            int(cluster_lengths.sum(dim=1).max()),
+            expected_scores,
+            expected_indices,
+            atol=0,
+            rtol=0,
+            divisor_for_int8=-1,
+        )
+
     def test_cooperative_int8_scan_matches_opt_out_raw_tensors(self) -> None:
         if not HAS_CUDA:
             self.skipTest("CUDA not available")
@@ -1028,13 +1062,11 @@ class TestFusedKmeanAnnWithPartialMasks(unittest.TestCase):
         self.assertTrue(scores.is_cuda)
         self.assertEqual(scores.size(0), 2)
 
-    def test_int8_with_partial_masks(self) -> None:
+    def _run_int8_with_partial_masks(self, cluster_size: int, dim: int) -> None:
         if not HAS_CUDA:
             self.skipTest("CUDA not available")
 
         n_clusters = 2
-        cluster_size = 33
-        dim = 256
         total_docs = n_clusters * cluster_size
         cluster_offsets = torch.arange(
             0, total_docs + 1, cluster_size, dtype=torch.long
@@ -1062,6 +1094,12 @@ class TestFusedKmeanAnnWithPartialMasks(unittest.TestCase):
             divisor_for_int8=127,
         )
         self.assertEqual(scores.dtype, torch.float16)
+
+    def test_int8_with_partial_masks(self) -> None:
+        self._run_int8_with_partial_masks(cluster_size=32, dim=64)
+
+    def test_int8_dim_256_with_partial_masks(self) -> None:
+        self._run_int8_with_partial_masks(cluster_size=33, dim=256)
 
     def test_fused_kmean_ann_with_partial_masks_multiple_matches_individual_cpu(
         self,
