@@ -419,6 +419,10 @@ TORCH_LIBRARY_FRAGMENT(st, m) {
   // was safely truncated; unlike a device assertion this does not poison the
   // CUDA context. Callers that derive a trusted static capacity may keep the
   // flag on-device as part of the captured graph.
+  // When filtering_bit_index is provided, it must be a contiguous int64
+  // tensor of shape (B,), with every value in [0, filtering_bit_mask.size(0)).
+  // The caller must ensure this range on every replay: mapping values are
+  // not bounds-checked, and overflow reports output capacity only.
   m.def(
       "fused_kmean_ann_cuda_graph("
       "Tensor cluster_offsets, "

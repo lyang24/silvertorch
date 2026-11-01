@@ -913,7 +913,7 @@ class TestFusedKmeanAnn(unittest.TestCase):
 
     def test_cuda_graph_scan_matches_eager(self) -> None:
         if not HAS_CUDA or torch.version.hip:
-            self.skipTest("CUDA not available")
+            self.skipTest("NVIDIA CUDA not available")
 
         cases = (
             (torch.int8, 64, False, -1, False),
@@ -942,7 +942,7 @@ class TestFusedKmeanAnn(unittest.TestCase):
 
     def test_cuda_graph_scan_empty_selection(self) -> None:
         if not HAS_CUDA or torch.version.hip:
-            self.skipTest("CUDA not available")
+            self.skipTest("NVIDIA CUDA not available")
 
         offsets = torch.tensor([0, 1], dtype=torch.long, device="cuda")
         cluster_ids = torch.empty((2, 0), dtype=torch.long, device="cuda")
@@ -978,7 +978,7 @@ class TestFusedKmeanAnn(unittest.TestCase):
 
     def test_cuda_graph_scan_replays_different_rows(self) -> None:
         if not HAS_CUDA or torch.version.hip:
-            self.skipTest("CUDA not available")
+            self.skipTest("NVIDIA CUDA not available")
 
         lengths_1d = torch.tensor(
             [0, 1, 31, 32, 33, 63, 64, 65], dtype=torch.long, device="cuda"
@@ -1051,7 +1051,7 @@ class TestFusedKmeanAnn(unittest.TestCase):
 
     def test_cuda_graph_scan_capacity_boundary_and_overflow(self) -> None:
         if not HAS_CUDA or torch.version.hip:
-            self.skipTest("CUDA not available")
+            self.skipTest("NVIDIA CUDA not available")
 
         offsets = torch.tensor([0, 32, 64], dtype=torch.long, device="cuda")
         cluster_ids = torch.tensor([[0, 1]], dtype=torch.long, device="cuda")
@@ -1087,7 +1087,7 @@ class TestFusedKmeanAnn(unittest.TestCase):
 
     def test_cuda_graph_scan_overflow_flag_resets_on_replay(self) -> None:
         if not HAS_CUDA or torch.version.hip:
-            self.skipTest("CUDA not available")
+            self.skipTest("NVIDIA CUDA not available")
 
         offsets = torch.tensor([0, 32, 96], dtype=torch.long, device="cuda")
         cluster_ids = torch.tensor([[1]], dtype=torch.long, device="cuda")
